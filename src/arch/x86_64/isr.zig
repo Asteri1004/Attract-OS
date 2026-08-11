@@ -12,6 +12,7 @@ const std = @import("std");
 const serial = @import("../../serial.zig");
 const port = @import("port.zig");
 const idt = @import("idt.zig");
+const pic = @import("pic.zig");
 
 /// 인터럽트 진입 시 스택에 쌓인 것들.
 ///
@@ -182,10 +183,34 @@ export fn isrCommon() callconv(.naked) void {
 /// 자가 진단 도구로 쓰기 좋다.
 const breakpoint_vector = 3;
 
+/// IRQ 핸들러 테이블. 인터럽트 컨텍스트에서 호출되므로
+/// 여기 등록하는 함수는 짧아야 한다. 긴 작업은 플래그만 세우고
+/// 게임 루프에서 처리한다.
+var irq_handlers = [_]?*const fn () void{null} ** 16;
+
+pub fn setIrqHandler(irq: u4, handler: *const fn () void) void {
+    irq_handlers[irq] = handler;
+}
+
 export fn isrDispatch(frame: *Frame) callconv(.{ .x86_64_sysv = .{} }) void {
+    const vec = frame.vector;
+
+    // ── 하드웨어 인터럽트 ──
+    if (vec >= pic.vector_base and vec < pic.vector_base + 16) {
+        const irq: u4 = @intCast(vec - pic.vector_base);
+
+        if (irq_handlers[irq]) |handler| handler();
+
+        // EOI를 빠뜨리면 같은 IRQ가 두 번 다시 오지 않는다.
+        // 타이머가 한 번 돌고 멈추는 버그의 대부분이 이것.
+        pic.endOfInterrupt(irq);
+        return;
+    }
+
+    // ── CPU 예외 ──
     dump(frame);
 
-    if (frame.vector == breakpoint_vector) {
+    if (vec == breakpoint_vector) {
         serial.println("!! breakpoint - resuming\n");
         return;
     }
@@ -262,9 +287,9 @@ fn dump(frame: *Frame) void {
 
 // ─────────────────────────────────────────────────────────────────────
 
-/// CPU 예외 32개를 IDT에 등록한다.
+/// CPU 예외 32개 + PIC IRQ 16개를 IDT에 등록한다.
 pub fn install() void {
-    inline for (0..32) |v| {
+    inline for (0..pic.vector_base + 16) |v| {
         idt.setHandler(v, &Stub(v).handler, .interrupt);
     }
 }
