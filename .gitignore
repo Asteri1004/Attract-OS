@@ -1,3 +1,10 @@
+# Zig
 .zig-cache/
 zig-out/
+
+# EDK2 펌웨어 변수 — 부팅할 때마다 펌웨어가 기록한다.
+# 커밋하면 매번 diff가 생기고 의미는 없다.
 ovmf_vars.fd
+
+# QEMU 디버그 로그
+*.log
