@@ -1,2 +1,3 @@
 .zig-cache/
 zig-out/
+ovmf_vars.fd
