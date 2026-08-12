@@ -10,7 +10,18 @@ pub fn build(b: *std.Build) void {
         .abi = .msvc,
     });
 
-    const optimize = b.standardOptimizeOption(.{});
+    // 기본을 ReleaseFast로 둔다.
+    //
+    // Debug 빌드는 배열 인덱싱마다 경계 검사, 산술마다 오버플로 검사를
+    // 넣는데, 픽셀 100만 개를 도는 렌더링 루프에서 이게 200배 넘는
+    // 차이를 만든다. 측정 결과 clear가 4591us -> 20us였다.
+    //
+    // 커널을 프레임 예산 안에서 돌려보는 게 이 프로젝트의 목적이므로
+    // 기본값을 최적화 쪽에 둔다. 안전 검사가 필요하면:
+    //   zig build run -Doptimize=Debug
+    const optimize = b.standardOptimizeOption(.{
+        .preferred_optimize_mode = .ReleaseFast,
+    });
 
     // 이름이 "bootx64"면 결과물은 bootx64.efi가 된다.
     // UEFI 펌웨어가 기본으로 찾는 경로가 \EFI\BOOT\BOOTX64.EFI 이기 때문에
@@ -89,6 +100,19 @@ pub fn build(b: *std.Build) void {
         // 디스크 이미지를 만들 필요가 없어서 편집→실행이 몇 초 안에 끝난다.
         "-drive",
         "format=raw,file=fat:rw:zig-out",
+
+        // 하드웨어 가속. 이게 없으면 QEMU는 명령을 하나씩 번역해서
+        // 실행하므로(TCG) 10~50배 느리고, TSC가 "호스트 시간"이 아니라
+        // "실행한 명령 수"를 따라가서 시간 측정이 왜곡된다.
+        //
+        // 순서대로 시도하고 안 되면 tcg로 떨어진다.
+        //   whpx : Windows (Hyper-V 플랫폼 활성화 필요)
+        //   kvm  : Linux
+        //   hvf  : macOS
+        "-accel", "whpx,kernel-irqchip=off",
+        "-accel", "kvm",
+        "-accel", "hvf",
+        "-accel", "tcg",
 
         "-serial",   "stdio",         // 시리얼 출력을 터미널로
         "-no-reboot",                 // 죽었을 때 무한 리부트 대신 정지

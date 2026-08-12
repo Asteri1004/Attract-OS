@@ -23,6 +23,17 @@ pub fn init() void {
     arch.pic.unmask(IRQ_TIMER);
 }
 
+/// TSC를 PIT 기준으로 보정한다. 인터럽트를 켠 뒤에 불러야 한다
+/// (타이머 틱이 돌아야 기준 시계가 생기므로).
+pub fn calibrateTsc() void {
+    arch.tsc.calibrate(millis, 100);
+}
+
+/// 부팅 이후 마이크로초. millis()보다 1000배 정밀하다.
+pub inline fn micros() u64 {
+    return arch.tsc.micros();
+}
+
 /// 부팅 이후 경과 밀리초.
 ///
 /// atomic으로 읽는 이유: 인터럽트가 바꾸는 값이라 컴파일러가

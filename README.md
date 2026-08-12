@@ -10,8 +10,8 @@ x86_64 UEFI 환경에서 처음부터 쌓아 올리는 커널. Zig로 작성.
 
 ## 현재 상태
 
-**M3 완료** — 펌웨어에서 독립해 자체 GDT/IDT/페이지 테이블 위에서 돈다.
-프리폴트 힙 덕에 매 프레임 동적 할당을 해도 프레임 시간이 흔들리지 않는다.
+**M3 완료 + 계측 기반 마련** — 펌웨어에서 독립해 자체 GDT/IDT/페이지 테이블
+위에서 돈다. 프리폴트 힙과 마이크로초 단위 구간 프로파일러를 갖췄다.
 
 | | 마일스톤 | 상태 |
 |---|---|---|
@@ -20,20 +20,30 @@ x86_64 UEFI 환경에서 처음부터 쌓아 올리는 커널. Zig로 작성.
 | M2a | exitBootServices, GDT, IDT, 예외 핸들러 | 완료 |
 | M2b | PIC, 타이머, 키보드, 60fps 루프 | 완료 |
 | M3 | 물리 할당자, 4레벨 페이징, 프리폴트 힙 | 완료 |
+| — | TSC 시계, 구간 프로파일러 | 완료 |
 | M4 | 데드라인 스케줄러, 지연 측정 | 진행 예정 |
 | M5 | 유저 모드, ELF 로더 | |
 
 전체 계획은 [docs/PLAN.md](docs/PLAN.md), 개발 과정은
 [docs/journal/](docs/journal/) 참고.
 
-### 측정값 (QEMU, 1280x800)
+### 측정값 (ReleaseFast + WHPX, 1280x800)
 
 ```
-물리 메모리  117 MiB 가용 (30088 pages)
-커널 힙      16 MiB, 프리폴트 완료
-프레임 예산  16 ms
-worst        13 ms   <- 여유 3ms. M4 전에 렌더링 비용을 줄여야 한다
+slot      avg(us)   worst(us)
+update          2           4
+clear        1403        3609
+draw          152         494
+present       352        1165
+work         1910        4072     <- update~present 합계
+
+프레임 예산 16667us 대비  avg 11% / worst 24%
+실측 fps                  62
 ```
+
+`clear`가 작업 시간의 73%를 차지하지만 손대지 않는다.
+여유가 76% 남는 상황에서 최적화할 이유가 없다.
+측정하고 판단한 결과가 "지금은 불필요"인 것도 결론이다.
 
 ## 빌드 & 실행
 
@@ -70,6 +80,33 @@ zig build run -Dqemu="D:/qemu/qemu-system-x86_64.exe" -Dovmf-code="D:/qemu/share
 ```
 
 방향키 또는 WASD로 사각형을 움직이고, ESC로 멈춘다.
+ESC를 누르면 시리얼에 구간별 통계가 정리되어 나온다.
+
+### 빌드 모드
+
+기본값은 **ReleaseFast**다. Debug 빌드는 배열 인덱싱마다 경계 검사,
+산술마다 오버플로 검사를 넣는데, 픽셀 100만 개를 도는 렌더링 루프에서
+두 자릿수 배율 차이를 만든다 (clear 기준 4591us -> 1403us).
+
+안전 검사가 필요하면:
+
+```
+zig build run -Doptimize=Debug
+```
+
+### 하드웨어 가속
+
+`build.zig`가 whpx / kvm / hvf / tcg 순으로 시도한다.
+가속이 없으면 QEMU가 명령을 하나씩 번역해 실행하므로(TCG) 크게 느리고,
+**TSC가 시간이 아니라 실행 사이클을 따라가서 시간 측정이 왜곡된다.**
+
+Windows에서 WHPX 활성화 (관리자 PowerShell, 재부팅 필요):
+
+```powershell
+Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
+```
+
+부팅 로그의 clock check가 둘 다 `ok`면 시계를 믿을 수 있다.
 
 ## 부팅 순서
 
@@ -98,7 +135,8 @@ src/
   serial.zig           COM1 UART
   framebuffer.zig      Canvas(백버퍼) + Framebuffer(화면)
   font.zig             8x8 비트맵 폰트
-  time.zig             틱, sleep
+  time.zig             틱, sleep, TSC 보정
+  profile.zig          구간별 시간 측정
   mem/
     mem.zig            메모리 초기화 순서
     physical.zig       물리 프레임 비트맵 할당자
@@ -113,6 +151,7 @@ src/
     pic.zig            8259 인터럽트 컨트롤러
     pit.zig            8254 타이머
     keyboard.zig       PS/2 (상태 배열 방식)
+    tsc.zig            사이클 카운터 (마이크로초 해상도)
 ```
 
 의존은 아래로만 흐른다. `arch` 계층은 위를 모르고,
@@ -164,6 +203,20 @@ Framebuffer는 한 번에 옮기는 일만 한다. 화면 메모리는 캐시가
 여분을 두기 때문. 지금 QEMU는 둘이 같지만 처음부터 분리해두지 않으면
 나중에 화면이 사선으로 밀린다.
 
+**계측을 계측한다.** 시계 보정이 틀리면 모든 값이 같은 비율로 어긋나므로
+숫자들끼리는 정합해 보인다. 다른 시계와 대조해야만 드러난다.
+부팅 시 PIT와 TSC로 같은 구간을 두 조건(busy / idle)으로 재서 맞춰본다.
+한 번만 재면 "어긋났다"까지만 알고 원인은 모른다.
+
+**TSC는 CPU가 도는 구간만 잰다.** invariant TSC가 아닌 환경에서
+TSC는 흐른 시간이 아니라 실행한 사이클을 센다. `hlt` 중에는 거의 멈춘다.
+그래서 작업 구간(update~present)만 TSC로 재고, 대기 시간은 재지 않는다.
+스케줄러가 알아야 할 것은 "작업이 얼마나 걸렸나"이지 "얼마나 잤나"가 아니다.
+
+**측정 없이 최적화하지 않는다.** 처음엔 "worst 13ms, 예산 16ms"로 보여
+렌더링을 고치려 했지만, 원인은 Debug 빌드 / 가속 미사용 / 잘못된 시계였다.
+셋 다 렌더링 코드와 무관했다.
+
 **커널 로그는 ASCII만.** em dash 같은 문자는 터미널에서 `??`로 깨진다.
 
 ## 옵션
@@ -173,7 +226,7 @@ Framebuffer는 한 번에 옮기는 일만 한다. 화면 메모리는 캐시가
 | `-Dqemu=` | `C:/Program Files/qemu/qemu-system-x86_64.exe` |
 | `-Dovmf-code=` | `C:/Program Files/qemu/share/edk2-x86_64-code.fd` |
 | `-Dovmf-vars=` | `ovmf_vars.fd` |
-| `-Doptimize=` | `Debug` |
+| `-Doptimize=` | `ReleaseFast` |
 
 ## 참고 자료
 

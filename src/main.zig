@@ -92,12 +92,72 @@ pub fn main() uefi.Status {
     serial.printDec(time.millis() - t0);
     serial.println(" ms (expected ~100)");
 
+    // TSC 보정. PIT가 돌기 시작한 뒤에야 할 수 있다.
+    // 이게 있어야 마이크로초 단위로 구간을 잴 수 있다.
+    time.calibrateTsc();
+    serial.print("[+] tsc calibrated: ~");
+    serial.printDec(arch.tsc.megahertz());
+    serial.print(" MHz, invariant=");
+    serial.print(if (arch.tsc.isInvariant()) "yes" else "no");
+    serial.println(if (arch.tsc.calibration_trusted) "" else "  [!] out of expected range");
+
+    // 시계 교차 검증.
+    //
+    // 두 번 잰다. 차이가 핵심이다:
+    //
+    //   busy : pause 루프로 도는 동안 - CPU가 계속 명령을 실행한다
+    //   idle : hlt로 자는 동안       - CPU가 멈춰 있다
+    //
+    // busy가 맞고 idle이 어긋나면, 이 환경의 TSC는 "흐른 시간"이 아니라
+    // "실행한 사이클"을 세고 있다는 뜻이다(invariant TSC가 아닌 경우).
+    // 그러면 TSC는 작업 구간 측정에만 쓰고, 대기 시간은 PIT로 재야 한다.
+    {
+        serial.println("[*] clock check:");
+        checkClock("busy", false);
+        checkClock("idle", true);
+    }
+
     // ── 8. 실행 ────────────────────────────────────────────────────
     serial.println("=== entering game loop ===");
     demo.run();
 }
 
 // ─────────────────────────────────────────────────────────────────────
+
+/// PIT와 TSC로 같은 구간을 재서 대조한다.
+fn checkClock(label: []const u8, comptime use_hlt: bool) void {
+    const span_ms = 200;
+
+    const pit_start = time.millis();
+    const tsc_start = time.micros();
+
+    if (use_hlt) {
+        time.sleep(span_ms);
+    } else {
+        const target = time.millis() + span_ms;
+        while (time.millis() < target) asm volatile ("pause");
+    }
+
+    const pit_ms = time.millis() - pit_start;
+    const tsc_ms = (time.micros() - tsc_start) / 1000;
+
+    serial.print("    ");
+    serial.print(label);
+    serial.print(" : pit ");
+    serial.printDec(pit_ms);
+    serial.print(" ms / tsc ");
+    serial.printDec(tsc_ms);
+    serial.print(" ms  ");
+
+    const diff = if (tsc_ms > pit_ms) tsc_ms - pit_ms else pit_ms - tsc_ms;
+    if (pit_ms > 0 and diff * 100 / pit_ms > 5) {
+        serial.print("[!] off by ");
+        serial.printDec(diff * 100 / pit_ms);
+        serial.println("%");
+    } else {
+        serial.println("ok");
+    }
+}
 
 /// GOP에서 프레임버퍼 정보를 얻고 백버퍼를 확보한다.
 ///
