@@ -1,11 +1,16 @@
-//! M2b 데모 — 움직이는 사각형.
+//! M3 데모 - 힙 위에서 도는 파티클.
 //!
 //! 커널에 하드코딩된 임시 앱이다. M5에서 유저 모드 ELF 로더가 생기면
 //! 이런 코드는 커널 밖으로 나간다. 그때까지의 시험대 역할.
+//!
+//! 이번 판의 목적은 **프리폴트 힙이 실제로 프레임을 지키는지** 보는 것이다.
+//! 매 프레임 할당과 해제를 반복하면서 worst 프레임 시간을 관찰한다.
 
+const std = @import("std");
 const kernel = @import("kernel.zig");
 const gfx = @import("framebuffer.zig");
 const time = @import("time.zig");
+const mem = @import("mem/mem.zig");
 const arch = @import("arch/x86_64/arch.zig");
 const serial = @import("serial.zig");
 
@@ -21,21 +26,37 @@ const good: Color = .{ .r = 120, .g = 220, .b = 150 };
 /// 16과 17이 섞인다. M4에서 고정밀 타이머로 옮기면 해결된다.
 const frame_ms: u64 = 16;
 
+const trail_len = 24;
+
 const Player = struct {
     x: i32,
     y: i32,
-    size: i32 = 48,
-    speed: i32 = 6,
+    size: i32 = 40,
+    speed: i32 = 7,
 };
+
+const Point = struct { x: i32, y: i32 };
 
 pub fn run() noreturn {
     const screen = kernel.screen;
     const canvas = kernel.canvas;
+    const allocator = mem.heap.allocator();
 
     var player: Player = .{
         .x = @intCast(screen.width / 2),
         .y = @intCast(screen.height / 2),
     };
+
+    // 힙에서 잡는 잔상 버퍼. 부팅 시 한 번.
+    const trail = allocator.alloc(Point, trail_len) catch {
+        kernel.panic("trail allocation failed");
+    };
+    for (trail) |*p| p.* = .{ .x = player.x, .y = player.y };
+    var trail_head: usize = 0;
+
+    serial.print("[+] trail buffer allocated (");
+    serial.printDec(trail.len * @sizeOf(Point));
+    serial.println(" bytes)");
 
     var frame: u64 = 0;
     var next_frame = time.millis();
@@ -46,7 +67,8 @@ pub fn run() noreturn {
 
         // ── update ──
         if (kbd.isDown(.escape)) {
-            serial.println("=== esc pressed, halting ===");
+            serial.println("=== esc pressed ===");
+            mem.heap.report();
             arch.halt();
         }
 
@@ -61,16 +83,45 @@ pub fn run() noreturn {
         player.x = @max(16, @min(max_x, player.x));
         player.y = @max(16, @min(max_y, player.y));
 
+        trail[trail_head] = .{ .x = player.x, .y = player.y };
+        trail_head = (trail_head + 1) % trail_len;
+
+        // 매 프레임 할당/해제. 보통의 OS라면 여기서 페이지 폴트가
+        // 튀어나와 프레임을 흔든다. 프리폴트 힙에서는 순수 포인터
+        // 계산이라 worst가 흔들리지 않아야 한다.
+        const scratch = allocator.alloc(u8, 4096) catch {
+            kernel.panic("scratch allocation failed");
+        };
+        scratch[0] = @truncate(frame);
+        allocator.free(scratch);
+
         // ── render ──
         canvas.clear(bg);
         canvas.drawBorder(8, accent);
         canvas.drawString(40, 32, kernel.name ++ " v" ++ kernel.version, accent, 3);
-        canvas.drawString(40, 72, "arrow keys / wasd to move   esc to halt", dim, 2);
+        canvas.drawString(40, 72, "paging + pre-faulted heap", dim, 2);
 
         var buf: [64]u8 = undefined;
-        canvas.drawString(40, 110, stat(&buf, "frame ", frame), dim, 2);
-        canvas.drawString(40, 132, stat(&buf, "ms    ", frame_start), dim, 2);
-        canvas.drawString(40, 154, stat(&buf, "worst ", worst_ms), if (worst_ms > frame_ms) accent else good, 2);
+        canvas.drawString(40, 108, stat(&buf, "frame  ", frame), dim, 2);
+        canvas.drawString(40, 130, stat(&buf, "allocs ", mem.heap.alloc_count), dim, 2);
+        canvas.drawString(40, 152, stat(&buf, "heap kb", mem.heap.bytes_in_use / 1024), dim, 2);
+        canvas.drawString(40, 174, stat(&buf, "worst  ", worst_ms), if (worst_ms > frame_ms) accent else good, 2);
+
+        // 잔상 - 오래된 것일수록 어둡게
+        var i: usize = 0;
+        while (i < trail_len) : (i += 1) {
+            const idx = (trail_head + i) % trail_len;
+            const age = @as(u32, @intCast(i));
+            const shade: u8 = @intCast(30 + age * 3);
+            const s: i32 = 8 + @as(i32, @intCast(age / 3));
+            canvas.fillRect(
+                @intCast(trail[idx].x + @divTrunc(player.size - s, 2)),
+                @intCast(trail[idx].y + @divTrunc(player.size - s, 2)),
+                @intCast(s),
+                @intCast(s),
+                .{ .r = shade / 2, .g = shade, .b = shade / 2 + 20 },
+            );
+        }
 
         canvas.fillRect(
             @intCast(player.x),
@@ -95,7 +146,7 @@ pub fn run() noreturn {
     }
 }
 
-/// 커널에는 std.fmt를 쓸 할당자가 없으니 직접 만든다.
+/// 커널에는 std.fmt를 쓸 여유가 없으니 직접 만든다.
 fn stat(buf: []u8, label: []const u8, value: u64) []const u8 {
     var i: usize = 0;
     for (label) |c| {

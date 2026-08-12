@@ -172,6 +172,12 @@ pub const Framebuffer = struct {
         return @as(usize, self.width) * @as(usize, self.height);
     }
 
+    /// 화면 메모리의 실제 바이트 크기. stride를 써야 한다 -
+    /// width로 계산하면 마지막 줄 일부가 매핑에서 빠진다.
+    pub fn byteSize(self: Framebuffer) u64 {
+        return @as(u64, self.stride) * @as(u64, self.height) * 4;
+    }
+
     /// 주어진 버퍼로 Canvas를 만든다. 버퍼는 width*height 이상이어야 한다.
     pub fn canvas(self: Framebuffer, buffer: []u32) Canvas {
         return .{

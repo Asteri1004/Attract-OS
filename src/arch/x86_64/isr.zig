@@ -183,6 +183,10 @@ export fn isrCommon() callconv(.naked) void {
 /// 자가 진단 도구로 쓰기 좋다.
 const breakpoint_vector = 3;
 
+/// 벡터 14 = page fault. M3에서 페이지 테이블을 직접 관리하기 시작하면
+/// 가장 자주 보게 될 예외다. CR2에 문제의 주소가 담긴다.
+const page_fault_vector = 14;
+
 /// IRQ 핸들러 테이블. 인터럽트 컨텍스트에서 호출되므로
 /// 여기 등록하는 함수는 짧아야 한다. 긴 작업은 플래그만 세우고
 /// 게임 루프에서 처리한다.
@@ -253,7 +257,7 @@ fn dump(frame: *Frame) void {
 
     // 페이지 폴트는 접근하려던 주소가 CR2에 남는다.
     // 이 한 줄이 페이지 폴트 디버깅의 8할이다.
-    if (vec == 14) {
+    if (vec == page_fault_vector) {
         const cr2 = asm volatile ("movq %%cr2, %[out]"
             : [out] "=r" (-> u64),
         );

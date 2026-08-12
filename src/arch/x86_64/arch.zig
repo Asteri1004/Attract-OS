@@ -14,6 +14,7 @@ pub const isr = @import("isr.zig");
 pub const pic = @import("pic.zig");
 pub const pit = @import("pit.zig");
 pub const keyboard = @import("keyboard.zig");
+pub const paging = @import("paging.zig");
 
 pub const Frame = isr.Frame;
 
