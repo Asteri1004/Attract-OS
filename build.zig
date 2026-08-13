@@ -13,15 +13,18 @@ pub fn build(b: *std.Build) void {
     // 기본을 ReleaseFast로 둔다.
     //
     // Debug 빌드는 배열 인덱싱마다 경계 검사, 산술마다 오버플로 검사를
-    // 넣는데, 픽셀 100만 개를 도는 렌더링 루프에서 이게 200배 넘는
-    // 차이를 만든다. 측정 결과 clear가 4591us -> 20us였다.
+    // 넣는데, 픽셀 100만 개를 도는 렌더링 루프에서 이게 두 자릿수 배율
+    // 차이를 만든다. 측정 결과 clear가 4591us -> 1403us였다.
     //
-    // 커널을 프레임 예산 안에서 돌려보는 게 이 프로젝트의 목적이므로
-    // 기본값을 최적화 쪽에 둔다. 안전 검사가 필요하면:
-    //   zig build run -Doptimize=Debug
-    const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .ReleaseFast,
-    });
+    // b.standardOptimizeOption(.{ .preferred_optimize_mode = ... })를
+    // 쓰지 않는 이유: 그 방식은 옵션 이름을 -Drelease(bool)로 바꾸고
+    // 기본값은 여전히 Debug로 둔다. 여기서는 기본을 최적화 쪽에 두고
+    // -Doptimize=Debug로 되돌릴 수 있게 직접 정의한다.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "빌드 모드 (Debug / ReleaseSafe / ReleaseFast / ReleaseSmall)",
+    ) orelse .ReleaseFast;
 
     // 이름이 "bootx64"면 결과물은 bootx64.efi가 된다.
     // UEFI 펌웨어가 기본으로 찾는 경로가 \EFI\BOOT\BOOTX64.EFI 이기 때문에

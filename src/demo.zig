@@ -1,11 +1,18 @@
-//! 렌더링 프로파일 데모.
+//! M4a 데모 - 두 스레드가 협력해서 한 프레임을 만든다.
 //!
-//! 커널에 하드코딩된 임시 앱이다. M5에서 유저 모드 ELF 로더가 생기면
-//! 이런 코드는 커널 밖으로 나간다.
+//! 게임에서 흔한 구조를 커널 스레드로 나눠본 것이다:
 //!
-//! 이번 판의 목적은 **프레임 예산이 어디로 새는지 보는 것**이다.
-//! M3까지의 측정은 "13ms"라는 숫자 하나뿐이었는데, 그걸로는
-//! 무엇을 고쳐야 할지 알 수 없다. 구간별로 쪼개서 본다.
+//!   logic  - 시뮬레이션. 프레임마다 파티클을 갱신한다
+//!   render - 그리기. 백버퍼를 채우고 화면에 올린다
+//!
+//! 지금은 협력적이라 서로 `yield()`를 불러야 넘어간다.
+//! M4b에서 타이머가 강제로 뺏게 되면, 예산을 넘긴 스레드는
+//! 말 그대로 문장 중간에 끊긴다.
+//!
+//! 두 스레드가 같은 데이터를 만지는데 락이 없는 이유:
+//! 단일 코어이고 전환 지점이 명시되어 있어서, `yield()`를 부르지
+//! 않는 구간은 원자적으로 실행된다. M4b에서 선점이 들어오면
+//! 이 가정이 깨지므로 그때 다시 봐야 한다.
 
 const std = @import("std");
 const kernel = @import("kernel.zig");
@@ -13,6 +20,7 @@ const gfx = @import("framebuffer.zig");
 const time = @import("time.zig");
 const mem = @import("mem/mem.zig");
 const prof = @import("profile.zig");
+const sched = @import("sched.zig");
 const arch = @import("arch/x86_64/arch.zig");
 const serial = @import("serial.zig");
 
@@ -29,142 +37,191 @@ const warn: Color = .{ .r = 255, .g = 90, .b = 90 };
 const budget_us: u64 = 16667;
 const frame_ms: u64 = 16;
 
+/// 스레드별 예산. 합이 전체 예산보다 작아야 여유가 남는다.
+const logic_budget: u64 = 4000;
+const render_budget: u64 = 10000;
+
+const particle_count = 220;
 const trail_len = 24;
 
-const Player = struct {
+// ─────────────────────────────────────────────────────────────────────
+// 공유 상태
+// ─────────────────────────────────────────────────────────────────────
+
+const Particle = struct {
     x: i32,
     y: i32,
+    vx: i32,
+    vy: i32,
+    life: i32,
+};
+
+const World = struct {
+    px: i32 = 0,
+    py: i32 = 0,
     size: i32 = 40,
     speed: i32 = 7,
+
+    particles: []Particle = &.{},
+    trail: []Point = &.{},
+    trail_head: usize = 0,
+
+    frame: u64 = 0,
+    fps: u64 = 0,
+    running: bool = true,
 };
 
 const Point = struct { x: i32, y: i32 };
 
-pub fn run() noreturn {
+var world: World = .{};
+
+/// 아주 단순한 난수. 결정적이라 재현이 쉽다.
+var rng_state: u32 = 0x1234_5678;
+fn rand() u32 {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state;
+}
+
+fn randRange(lo: i32, hi: i32) i32 {
+    const span: u32 = @intCast(hi - lo + 1);
+    return lo + @as(i32, @intCast(rand() % span));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// logic 스레드
+// ─────────────────────────────────────────────────────────────────────
+
+fn logicThread() callconv(.c) noreturn {
+    while (true) {
+        prof.begin(.update);
+
+        if (kbd.isDown(.escape)) world.running = false;
+
+        const screen = kernel.screen;
+        const max_x: i32 = @as(i32, @intCast(screen.width)) - world.size - 16;
+        const max_y: i32 = @as(i32, @intCast(screen.height)) - world.size - 16;
+
+        if (kbd.isDown(.left) or kbd.isDown(.a)) world.px -= world.speed;
+        if (kbd.isDown(.right) or kbd.isDown(.d)) world.px += world.speed;
+        if (kbd.isDown(.up) or kbd.isDown(.w)) world.py -= world.speed;
+        if (kbd.isDown(.down) or kbd.isDown(.s)) world.py += world.speed;
+
+        world.px = @max(16, @min(max_x, world.px));
+        world.py = @max(16, @min(max_y, world.py));
+
+        world.trail[world.trail_head] = .{ .x = world.px, .y = world.py };
+        world.trail_head = (world.trail_head + 1) % trail_len;
+
+        // 파티클 시뮬레이션. 죽은 것은 플레이어 위치에서 되살린다.
+        for (world.particles) |*p| {
+            p.x += p.vx;
+            p.y += p.vy;
+            p.vy += 1; // 중력
+            p.life -= 1;
+
+            if (p.life <= 0 or p.y > max_y) {
+                p.* = .{
+                    .x = world.px + @divTrunc(world.size, 2),
+                    .y = world.py + @divTrunc(world.size, 2),
+                    .vx = randRange(-6, 6),
+                    .vy = randRange(-14, -4),
+                    .life = randRange(30, 90),
+                };
+            }
+        }
+
+        prof.end(.update);
+        sched.yield(); // render에게 넘긴다
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// render 스레드
+// ─────────────────────────────────────────────────────────────────────
+
+fn renderThread() callconv(.c) noreturn {
     const screen = kernel.screen;
     const canvas = kernel.canvas;
-    const allocator = mem.heap.allocator();
 
-    var player: Player = .{
-        .x = @intCast(screen.width / 2),
-        .y = @intCast(screen.height / 2),
-    };
-
-    const trail = allocator.alloc(Point, trail_len) catch {
-        kernel.panic("trail allocation failed");
-    };
-    for (trail) |*p| p.* = .{ .x = player.x, .y = player.y };
-    var trail_head: usize = 0;
-
-    var frame: u64 = 0;
     var next_frame = time.millis();
-    var worst_frame_us: u64 = 0;
-
-    // 실측 FPS. 프로파일러가 아니라 PIT로 직접 센다.
-    // 두 시계가 어긋나 있으면 여기서 드러난다.
-    var fps: u64 = 0;
+    var worst_work_us: u64 = 0;
     var fps_frames: u64 = 0;
     var fps_mark = time.millis();
 
     while (true) {
         prof.begin(.work);
 
-        // ── update ──
-        prof.begin(.update);
-        {
-            if (kbd.isDown(.escape)) {
-                serial.println("\n=== esc pressed ===");
-                serial.println("[*] frame profile:");
-                prof.report();
-                mem.heap.report();
-                arch.halt();
-            }
-
-            const max_x: i32 = @as(i32, @intCast(screen.width)) - player.size - 16;
-            const max_y: i32 = @as(i32, @intCast(screen.height)) - player.size - 16;
-
-            if (kbd.isDown(.left) or kbd.isDown(.a)) player.x -= player.speed;
-            if (kbd.isDown(.right) or kbd.isDown(.d)) player.x += player.speed;
-            if (kbd.isDown(.up) or kbd.isDown(.w)) player.y -= player.speed;
-            if (kbd.isDown(.down) or kbd.isDown(.s)) player.y += player.speed;
-
-            player.x = @max(16, @min(max_x, player.x));
-            player.y = @max(16, @min(max_y, player.y));
-
-            trail[trail_head] = .{ .x = player.x, .y = player.y };
-            trail_head = (trail_head + 1) % trail_len;
-
-            // 매 프레임 할당/해제. 프리폴트 힙이 일하는지 확인용.
-            const scratch = allocator.alloc(u8, 4096) catch {
-                kernel.panic("scratch allocation failed");
-            };
-            scratch[0] = @truncate(frame);
-            allocator.free(scratch);
-        }
-        prof.end(.update);
-
-        // ── clear ──
         prof.begin(.clear);
         canvas.clear(bg);
         prof.end(.clear);
 
-        // ── draw ──
         prof.begin(.draw);
         {
             canvas.drawBorder(8, accent);
             canvas.drawString(40, 32, kernel.name ++ " v" ++ kernel.version, accent, 3);
 
             var buf: [80]u8 = undefined;
-            const lines = [_]struct { label: []const u8, slot: ?prof.Slot }{
-                .{ .label = "update ", .slot = .update },
-                .{ .label = "clear  ", .slot = .clear },
-                .{ .label = "draw   ", .slot = .draw },
-                .{ .label = "present", .slot = .present },
-            };
-
             var y: u32 = 80;
-            canvas.drawString(40, y, "us     last   worst", dim, 2);
+            canvas.drawString(40, y, "us      last    worst", dim, 2);
             y += 24;
 
-            for (lines) |line| {
-                const slot = line.slot.?;
-                const last = prof.lastMicros(slot);
-                const worst = prof.worstMicros(slot);
-                const c: Color = if (worst > budget_us / 2) warn else dim;
-                canvas.drawString(40, y, twoCol(&buf, line.label, last, worst), c, 2);
+            const slots = [_]struct { label: []const u8, slot: prof.Slot }{
+                .{ .label = "update  ", .slot = .update },
+                .{ .label = "clear   ", .slot = .clear },
+                .{ .label = "draw    ", .slot = .draw },
+                .{ .label = "present ", .slot = .present },
+            };
+            for (slots) |s| {
+                canvas.drawString(40, y, twoCol(&buf, s.label, prof.lastMicros(s.slot), prof.worstMicros(s.slot)), dim, 2);
                 y += 22;
             }
 
-            y += 12;
-            const over = worst_frame_us > budget_us;
-            canvas.drawString(40, y, twoCol(&buf, "work   ", prof.lastMicros(.work), worst_frame_us), if (over) warn else good, 2);
+            y += 10;
+            const over = worst_work_us > budget_us;
+            canvas.drawString(40, y, twoCol(&buf, "work    ", prof.lastMicros(.work), worst_work_us), if (over) warn else good, 2);
 
-            // 실측 FPS. 60에서 크게 벗어나면 페이싱이나 시계가 잘못된 것.
-            y += 24;
-            const fps_ok = fps >= 55 and fps <= 65;
-            canvas.drawString(40, y, twoCol(&buf, "fps    ", fps, 60), if (fps_ok) good else warn, 2);
-
-            // 예산의 몇 %를 썼는가. 스케줄러에게 남는 시간이 이 나머지다.
             y += 22;
-            const pct = worst_frame_us * 100 / budget_us;
-            canvas.drawString(40, y, twoCol(&buf, "budget%", pct, 100), if (pct > 80) warn else good, 2);
+            const fps_ok = world.fps >= 55 and world.fps <= 65;
+            canvas.drawString(40, y, twoCol(&buf, "fps     ", world.fps, 60), if (fps_ok) good else warn, 2);
 
-            // 예산 막대. 최악 프레임이 예산의 몇 %인지 한눈에.
-            const bar_w: u32 = 400;
-            const filled: u32 = @intCast(@min(bar_w, worst_frame_us * bar_w / budget_us));
-            canvas.fillRect(40, y + 30, bar_w, 12, .{ .r = 30, .g = 34, .b = 44 });
-            canvas.fillRect(40, y + 30, filled, 12, if (over) warn else good);
+            // 스레드별 최악 실행 시간과 예산
+            y += 32;
+            canvas.drawString(40, y, "threads   worst   budget", dim, 2);
+            y += 24;
+            var t: u8 = 0;
+            while (t < sched.count()) : (t += 1) {
+                const th = sched.get(t);
+                if (th.is_idle) continue; // 유휴 시간은 CPU 사용이 아니다
+                const c: Color = if (th.overruns > 0) warn else dim;
+                canvas.drawString(40, y, thread_line(&buf, th), c, 2);
+                y += 22;
+            }
+
+            // 파티클
+            for (world.particles) |p| {
+                if (p.x < 0 or p.y < 0) continue;
+                const heat: u8 = @intCast(@min(255, @as(u32, @intCast(@max(0, p.life))) * 3));
+                canvas.fillRect(
+                    @intCast(p.x),
+                    @intCast(p.y),
+                    4,
+                    4,
+                    .{ .r = 255, .g = heat, .b = heat / 3 },
+                );
+            }
 
             // 잔상
             var i: usize = 0;
             while (i < trail_len) : (i += 1) {
-                const idx = (trail_head + i) % trail_len;
-                const age = @as(u32, @intCast(i));
+                const idx = (world.trail_head + i) % trail_len;
+                const age: u32 = @intCast(i);
                 const shade: u8 = @intCast(30 + age * 3);
                 const s: i32 = 8 + @as(i32, @intCast(age / 3));
                 canvas.fillRect(
-                    @intCast(trail[idx].x + @divTrunc(player.size - s, 2)),
-                    @intCast(trail[idx].y + @divTrunc(player.size - s, 2)),
+                    @intCast(world.trail[idx].x + @divTrunc(world.size - s, 2)),
+                    @intCast(world.trail[idx].y + @divTrunc(world.size - s, 2)),
                     @intCast(s),
                     @intCast(s),
                     .{ .r = shade / 2, .g = shade, .b = shade / 2 + 20 },
@@ -172,52 +229,92 @@ pub fn run() noreturn {
             }
 
             canvas.fillRect(
-                @intCast(player.x),
-                @intCast(player.y),
-                @intCast(player.size),
-                @intCast(player.size),
+                @intCast(world.px),
+                @intCast(world.py),
+                @intCast(world.size),
+                @intCast(world.size),
                 good,
             );
         }
         prof.end(.draw);
 
-        // ── present ──
         prof.begin(.present);
         screen.present(canvas);
         prof.end(.present);
 
         prof.end(.work);
 
-        // ── pace ──
-        // 여기는 hlt로 자는 구간이라 TSC로 재지 않는다.
-        // 잰다 해도 CPU가 멈춰 있는 동안의 사이클은 세어지지 않는다.
-        const work_us = prof.lastMicros(.work);
-        if (frame > 60 and work_us > worst_frame_us) worst_frame_us = work_us;
-
-        next_frame += frame_ms;
-        time.sleepUntil(next_frame);
+        const work = prof.lastMicros(.work);
+        if (world.frame > 60 and work > worst_work_us) worst_work_us = work;
 
         prof.frameEnd();
-        frame += 1;
-
-        // 1초마다 실측 FPS 갱신
+        world.frame += 1;
         fps_frames += 1;
+
         const now_ms = time.millis();
         if (now_ms - fps_mark >= 1000) {
-            fps = fps_frames * 1000 / (now_ms - fps_mark);
+            world.fps = fps_frames * 1000 / (now_ms - fps_mark);
             fps_frames = 0;
             fps_mark = now_ms;
         }
 
-        // 5초마다 시리얼로도 남긴다. 화면을 못 볼 때를 대비.
-        if (frame % 300 == 0) {
-            serial.print("[frame ");
-            serial.printDec(frame);
-            serial.print("]  measured fps: ");
-            serial.printDec(fps);
-            serial.print("\n");
+        if (!world.running) {
+            serial.println("\n=== esc pressed ===");
+            serial.println("[*] frame profile:");
             prof.report();
+            serial.println("[*] threads:");
+            sched.report();
+            mem.heap.report();
+            arch.halt();
         }
+
+        if (world.frame % 300 == 0) {
+            serial.print("[frame ");
+            serial.printDec(world.frame);
+            serial.print("]  fps ");
+            serial.printDec(world.fps);
+            serial.print("\n");
+            sched.report();
+        }
+
+        // 프레임 경계. 다음 프레임까지 자면서 logic에게 시간을 넘긴다.
+        sched.beginFrame();
+        next_frame += frame_ms;
+        sched.sleepUntil(next_frame);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+
+pub fn run() noreturn {
+    const allocator = mem.heap.allocator();
+    const screen = kernel.screen;
+
+    world.px = @intCast(screen.width / 2);
+    world.py = @intCast(screen.height / 2);
+
+    world.trail = allocator.alloc(Point, trail_len) catch
+        kernel.panic("trail allocation failed");
+    for (world.trail) |*p| p.* = .{ .x = world.px, .y = world.py };
+
+    world.particles = allocator.alloc(Particle, particle_count) catch
+        kernel.panic("particle allocation failed");
+    for (world.particles) |*p| p.* = .{ .x = -1, .y = -1, .vx = 0, .vy = 0, .life = 0 };
+
+    sched.init();
+
+    _ = sched.spawn("logic", logicThread, sched.default_stack_size, logic_budget) catch
+        kernel.panic("cannot spawn logic thread");
+    _ = sched.spawn("render", renderThread, sched.default_stack_size, render_budget) catch
+        kernel.panic("cannot spawn render thread");
+
+    serial.println("=== scheduler running ===");
+
+    // main 스레드는 이제 할 일이 없다. 계속 양보하면서
+    // 아무도 준비되지 않았을 때만 CPU를 재운다.
+    while (true) {
+        sched.yield();
+        arch.port.hlt();
     }
 }
 
@@ -230,6 +327,18 @@ fn twoCol(buf: []u8, label: []const u8, a: u64, b: u64) []const u8 {
     }
     i = writePadded(buf, i, a, 7);
     i = writePadded(buf, i, b, 8);
+    return buf[0..i];
+}
+
+fn thread_line(buf: []u8, t: *const sched.Thread) []const u8 {
+    var i: usize = 0;
+    for (t.name) |c| {
+        buf[i] = c;
+        i += 1;
+    }
+    while (i < 10) : (i += 1) buf[i] = ' ';
+    i = writePadded(buf, i, t.worst_us, 7);
+    i = writePadded(buf, i, t.budget_us, 9);
     return buf[0..i];
 }
 
@@ -246,7 +355,6 @@ fn writePadded(buf: []u8, start: usize, value: u64, width: usize) usize {
             n += 1;
         }
     }
-
     var i = start;
     var pad = if (width > n) width - n else 0;
     while (pad > 0) : (pad -= 1) {
