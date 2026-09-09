@@ -13,8 +13,19 @@ const IRQ_TIMER: u4 = 0;
 
 var ticks: u64 = 0;
 
+/// 매 틱마다 부를 훅. 스케줄러가 여기에 걸려 예산을 감시한다.
+///
+/// time이 sched를 직접 import하지 않는 이유: sched가 time을 쓰므로
+/// 순환 의존이 된다. 콜백으로 방향을 끊는다.
+var tick_hook: ?*const fn () void = null;
+
+pub fn setTickHook(hook: *const fn () void) void {
+    tick_hook = hook;
+}
+
 fn onTick() void {
     @atomicStore(u64, &ticks, @atomicLoad(u64, &ticks, .monotonic) + 1, .monotonic);
+    if (tick_hook) |hook| hook();
 }
 
 pub fn init() void {

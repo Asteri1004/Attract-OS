@@ -8,7 +8,7 @@ const serial = @import("serial.zig");
 const gfx = @import("framebuffer.zig");
 
 pub const name = "Attract";
-pub const version = "0.5.0";
+pub const version = "0.6.0";
 
 /// 화면. 부팅 시 한 번 세팅되고 이후 바뀌지 않는다.
 pub var screen: gfx.Framebuffer = undefined;

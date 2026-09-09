@@ -41,6 +41,13 @@ const frame_ms: u64 = 16;
 const logic_budget: u64 = 4000;
 const render_budget: u64 = 10000;
 
+/// 마감까지 남겨둘 여유. **작을수록 급하다.**
+///
+/// render는 프레임 끝에 반드시 화면이 나가야 하므로 여유가 없다.
+/// logic은 render보다 먼저 끝나야 하니 마감을 더 이르게 잡는다.
+const logic_slack: u64 = 12000; // 프레임 시작 후 ~4.7ms 안에
+const render_slack: u64 = 1000; // 프레임 끝 1ms 전까지
+
 const particle_count = 220;
 const trail_len = 24;
 
@@ -69,6 +76,19 @@ const World = struct {
     frame: u64 = 0,
     fps: u64 = 0,
     running: bool = true,
+
+    /// 인위적 부하. 스페이스로 켜고 끈다.
+    ///
+    /// 선점이 실제로 작동하는지 보려면 예산을 넘기는 스레드가 필요하다.
+    /// 평소에는 logic이 2us밖에 안 써서 선점될 일이 없다.
+    stress: bool = false,
+    stress_edge: bool = false,
+
+    /// 아직 화면에 반영되지 않은 입력의 시각 (us). 0이면 없음.
+    pending_input_us: u64 = 0,
+    /// 마지막으로 측정된 입력 -> 화면 지연
+    input_latency_us: u64 = 0,
+    worst_latency_us: u64 = 0,
 };
 
 const Point = struct { x: i32, y: i32 };
@@ -96,6 +116,15 @@ fn randRange(lo: i32, hi: i32) i32 {
 fn logicThread() callconv(.c) noreturn {
     while (true) {
         prof.begin(.update);
+
+        // 아직 화면에 안 나간 입력이 있으면 시각을 물려받는다.
+        // render가 present 직후에 이 값과 대조해 지연을 잰다.
+        if (kbd.takePendingPress()) |t| world.pending_input_us = t;
+
+        // 스페이스로 부하 토글. 눌린 순간만 반응하도록 경계를 검사한다.
+        const space_now = kbd.isDown(.space);
+        if (space_now and !world.stress_edge) world.stress = !world.stress;
+        world.stress_edge = space_now;
 
         if (kbd.isDown(.escape)) world.running = false;
 
@@ -132,8 +161,30 @@ fn logicThread() callconv(.c) noreturn {
             }
         }
 
+        // ── 인위적 부하 ──
+        //
+        // 예산(4000us)을 훌쩍 넘기는 시간을 일부러 태운다.
+        //
+        // 산술 루프를 돌리는 방식은 쓸 수 없다. `junk = junk*a + b` 같은
+        // 선형 합동은 LLVM이 닫힌 형태로 계산해버려서 300만 번 반복이
+        // 순식간에 끝난다(실제로 겪었다: logic worst 14us).
+        // 시계를 읽으며 도는 건 최적화할 수 없다 - rdtsc는 부작용이 있는
+        // 명령이라 컴파일러가 건드리지 못한다.
+        //
+        // 선점이 없다면 이 루프가 끝날 때까지 render가 실행되지 못해
+        // 프레임이 통째로 밀린다. 선점이 있다면 예산을 넘긴 순간
+        // **이 루프 한복판에서** 끊기고 render로 넘어간다.
+        if (world.stress) {
+            const until = time.micros() + 12_000; // 예산의 3배
+            while (time.micros() < until) {}
+        }
+
         prof.end(.update);
-        sched.yield(); // render에게 넘긴다
+
+        // 이번 프레임 몫 끝. 다음 프레임까지 잠든다.
+        // M4a에서는 여기서 yield()만 불러서 CPU가 남으면 계속 돌았다
+        // (프레임당 14회). 이제 스케줄러가 경계를 관리한다.
+        sched.endFrame();
     }
 }
 
@@ -186,9 +237,28 @@ fn renderThread() callconv(.c) noreturn {
             const fps_ok = world.fps >= 55 and world.fps <= 65;
             canvas.drawString(40, y, twoCol(&buf, "fps     ", world.fps, 60), if (fps_ok) good else warn, 2);
 
+            // 스케줄러 계측. onTick이 실제로 불리는지 확인용.
+            y += 22;
+            canvas.drawString(40, y, twoCol(&buf, "ticks   ", sched.tick_count, sched.preempt_checks), dim, 2);
+
+            // 부하 상태
+            y += 22;
+            canvas.drawString(
+                40,
+                y,
+                if (world.stress) "STRESS ON  (space to stop)" else "space: stress test",
+                if (world.stress) warn else dim,
+                2,
+            );
+
+            // 입력 -> 화면 지연. 이 커널이 존재하는 이유다.
+            y += 22;
+            const lat_ok = world.worst_latency_us < budget_us * 2;
+            canvas.drawString(40, y, twoCol(&buf, "input ms", world.input_latency_us / 1000, world.worst_latency_us / 1000), if (lat_ok) good else warn, 2);
+
             // 스레드별 최악 실행 시간과 예산
             y += 32;
-            canvas.drawString(40, y, "threads   worst   budget", dim, 2);
+            canvas.drawString(40, y, "thread   worst budget preempt", dim, 2);
             y += 24;
             var t: u8 = 0;
             while (t < sched.count()) : (t += 1) {
@@ -244,6 +314,18 @@ fn renderThread() callconv(.c) noreturn {
 
         prof.end(.work);
 
+        // ── 입력 -> 화면 지연 ──
+        // 키가 눌린 순간(인터럽트에서 기록)부터 그 결과가 화면에
+        // 나간 지금까지. 사람이 실제로 체감하는 값이다.
+        if (world.pending_input_us > 0) {
+            const latency = time.micros() -| world.pending_input_us;
+            world.input_latency_us = latency;
+            if (world.frame > 60 and latency > world.worst_latency_us) {
+                world.worst_latency_us = latency;
+            }
+            world.pending_input_us = 0;
+        }
+
         const work = prof.lastMicros(.work);
         if (world.frame > 60 and work > worst_work_us) worst_work_us = work;
 
@@ -277,10 +359,15 @@ fn renderThread() callconv(.c) noreturn {
             sched.report();
         }
 
-        // 프레임 경계. 다음 프레임까지 자면서 logic에게 시간을 넘긴다.
-        sched.beginFrame();
+        // 프레임 경계.
+        //
+        // render는 프레임 마스터라 endFrame()을 부르지 않는다.
+        // 부르면 frame_done이 되어 스케줄에서 빠지는데, 잠든 스레드를
+        // 깨울 advanceFrame()을 부를 사람이 자기 자신이라 교착에 빠진다.
+        // 대신 sleepUntil로 대기한다 - 이건 시각이 되면 스케줄러가 깨운다.
         next_frame += frame_ms;
         sched.sleepUntil(next_frame);
+        sched.advanceFrame();
     }
 }
 
@@ -301,11 +388,14 @@ pub fn run() noreturn {
         kernel.panic("particle allocation failed");
     for (world.particles) |*p| p.* = .{ .x = -1, .y = -1, .vx = 0, .vy = 0, .life = 0 };
 
-    sched.init();
+    sched.init(budget_us);
 
-    _ = sched.spawn("logic", logicThread, sched.default_stack_size, logic_budget) catch
+    // 타이머가 매 틱마다 예산을 감시하게 한다.
+    time.setTickHook(sched.onTick);
+
+    _ = sched.spawn("logic", logicThread, sched.default_stack_size, logic_budget, logic_slack) catch
         kernel.panic("cannot spawn logic thread");
-    _ = sched.spawn("render", renderThread, sched.default_stack_size, render_budget) catch
+    _ = sched.spawn("render", renderThread, sched.default_stack_size, render_budget, render_slack) catch
         kernel.panic("cannot spawn render thread");
 
     serial.println("=== scheduler running ===");
@@ -336,9 +426,10 @@ fn thread_line(buf: []u8, t: *const sched.Thread) []const u8 {
         buf[i] = c;
         i += 1;
     }
-    while (i < 10) : (i += 1) buf[i] = ' ';
-    i = writePadded(buf, i, t.worst_us, 7);
-    i = writePadded(buf, i, t.budget_us, 9);
+    while (i < 9) : (i += 1) buf[i] = ' ';
+    i = writePadded(buf, i, t.worst_us, 6);
+    i = writePadded(buf, i, t.budget_us, 7);
+    i = writePadded(buf, i, t.preemptions, 6);
     return buf[0..i];
 }
 

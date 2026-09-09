@@ -9,6 +9,7 @@
 //! 유지하려면 인터럽트는 최대한 짧게 끝내고 빠져나와야 한다.
 
 const port = @import("port.zig");
+const tsc = @import("tsc.zig");
 
 const DATA: u16 = 0x60;
 
@@ -30,6 +31,16 @@ pub const Key = enum(u8) {
 };
 
 var pressed = [_]bool{false} ** Key.count;
+
+/// 가장 최근에 키가 눌린 시각 (부팅 이후 us).
+///
+/// **인터럽트 핸들러 안에서 찍는 게 핵심이다.** 게임 루프에서 재면
+/// 이미 폴링 지연이 섞여 들어간다. 사람이 키를 누른 순간에 가장
+/// 가까운 시점은 하드웨어가 인터럽트를 올린 바로 이때다.
+var last_press_us: u64 = 0;
+
+/// 아직 화면에 반영되지 않은 입력이 있는가.
+var press_pending: bool = false;
 
 /// 다음 바이트가 확장 키의 두 번째 바이트인지.
 /// 화살표 키 같은 것들은 0xE0을 앞세워 두 바이트로 온다.
@@ -69,7 +80,26 @@ pub fn handleScancode(code: u8) void {
 
     extended = false;
 
-    if (key) |k| pressed[@intFromEnum(k)] = !is_release;
+    if (key) |k| {
+        const was_down = pressed[@intFromEnum(k)];
+        pressed[@intFromEnum(k)] = !is_release;
+
+        // 눌리는 순간(뗀 상태 -> 누른 상태)만 기록한다.
+        // 키를 계속 누르고 있으면 반복 스캔코드가 오는데,
+        // 그건 새 입력이 아니다.
+        if (!is_release and !was_down) {
+            last_press_us = tsc.micros();
+            press_pending = true;
+        }
+    }
+}
+
+/// 반영 대기 중인 입력이 있으면 그 시각을 가져가고 표시를 지운다.
+/// 화면에 결과가 나간 뒤 이 값과 현재 시각의 차이가 체감 지연이다.
+pub fn takePendingPress() ?u64 {
+    if (!press_pending) return null;
+    press_pending = false;
+    return last_press_us;
 }
 
 /// IRQ1 핸들러가 호출. 데이터 포트를 반드시 읽어야 하며,

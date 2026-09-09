@@ -203,11 +203,18 @@ export fn isrDispatch(frame: *Frame) callconv(.{ .x86_64_sysv = .{} }) void {
     if (vec >= pic.vector_base and vec < pic.vector_base + 16) {
         const irq: u4 = @intCast(vec - pic.vector_base);
 
-        if (irq_handlers[irq]) |handler| handler();
-
-        // EOI를 빠뜨리면 같은 IRQ가 두 번 다시 오지 않는다.
-        // 타이머가 한 번 돌고 멈추는 버그의 대부분이 이것.
+        // **EOI를 핸들러보다 먼저 보낸다.**
+        //
+        // 타이머 핸들러는 예산을 넘긴 스레드를 선점하려고 여기서
+        // 컨텍스트를 바꿀 수 있다. 그러면 이 함수는 한동안 돌아오지
+        // 않고, EOI가 그만큼 늦어진다. PIC은 EOI를 받기 전까지 같은
+        // IRQ를 다시 보내지 않으므로 타이머가 통째로 멈춘다.
+        //
+        // 먼저 보내도 안전한 이유: 이 핸들러는 interrupt gate로
+        // 진입해서 인터럽트가 꺼져 있다. 중첩될 여지가 없다.
         pic.endOfInterrupt(irq);
+
+        if (irq_handlers[irq]) |handler| handler();
         return;
     }
 

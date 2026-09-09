@@ -15,21 +15,23 @@
 //!     (전환한 척만 하고 계속 같은 스레드가 실행됨, 저장된 rsp가 0)
 //!
 //! 어셈블리를 직접 심으면 이런 여지가 전혀 없다.
-//! 실제 전환 코드. SysV 규약이니 rdi = save_to, rsi = new_rsp.
-//!
-//! 저장할 레지스터가 6개뿐인 이유:
-//! 이 코드는 **일반 함수 호출로** 진입한다. SysV ABI에서 함수 호출은
-//! caller-saved 레지스터(rax, rcx, rdx, rsi, rdi, r8-r11)를 망가뜨려도
-//! 된다고 약속되어 있고, 컴파일러가 필요하면 알아서 저장해둔다.
-//! 그러니 callee-saved(rbx, rbp, r12-r15)만 챙기면 된다.
-//!
-//! 인터럽트로 강제 전환할 때(M4b)는 얘기가 다르다. 그건 함수 호출이
-//! 아니라 예고 없는 침입이라 전부 저장해야 한다.
+
+// 실제 전환 코드. SysV 규약이니 rdi = save_to, rsi = new_rsp.
+//
+// 저장할 레지스터가 6개뿐인 이유:
+// 이 코드는 **일반 함수 호출로** 진입한다. SysV ABI에서 함수 호출은
+// caller-saved 레지스터(rax, rcx, rdx, rsi, rdi, r8-r11)를 망가뜨려도
+// 된다고 약속되어 있고, 컴파일러가 필요하면 알아서 저장해둔다.
+// 그러니 callee-saved(rbx, rbp, r12-r15)만 챙기면 된다.
+//
+// 인터럽트로 강제 전환할 때(M4b)는 얘기가 다르다. 그건 함수 호출이
+// 아니라 예고 없는 침입이라 전부 저장해야 한다.
 comptime {
     asm (
         \\.text
         \\.globl attractSwitchContext
         \\attractSwitchContext:
+        \\  pushfq              /* rflags. IF(인터럽트 허용) 비트가 여기 있다 */
         \\  pushq %rbp
         \\  pushq %rbx
         \\  pushq %r12
@@ -48,6 +50,7 @@ comptime {
         \\  popq %r12
         \\  popq %rbx
         \\  popq %rbp
+        \\  popfq               /* 저 스레드가 저장해둔 인터럽트 상태로 */
         \\
         \\  /* 새 스레드의 복귀 주소로 점프.
         \\     갓 생성된 스레드라면 initStack이 심어둔 진입점으로. */
@@ -55,12 +58,12 @@ comptime {
     );
 }
 
-/// 현재 스레드의 rsp를 `save_to`에 넣고, `new_rsp`로 갈아탄다.
-///
-/// 이 함수는 **두 번 돌아온다**는 점이 특이하다.
-/// 호출한 순간에는 다른 스레드로 떠나고, 나중에 누군가 이 스레드로
-/// 다시 전환해줄 때 마치 방금 리턴한 것처럼 이어진다.
-/// 그 사이에 몇 프레임이 흘렀는지 이 함수는 모른다.
+// 현재 스레드의 rsp를 `save_to`에 넣고, `new_rsp`로 갈아탄다.
+//
+// 이 함수는 **두 번 돌아온다**는 점이 특이하다.
+// 호출한 순간에는 다른 스레드로 떠나고, 나중에 누군가 이 스레드로
+// 다시 전환해줄 때 마치 방금 리턴한 것처럼 이어진다.
+// 그 사이에 몇 프레임이 흘렀는지 이 함수는 모른다.
 pub extern fn attractSwitchContext(
     save_to: *u64,
     new_rsp: u64,
@@ -68,32 +71,33 @@ pub extern fn attractSwitchContext(
 
 pub const switchTo = attractSwitchContext;
 
-/// 스택 최상단에서 초기 프레임을 만든다.
-///
-/// 스택에 "이미 한 번 전환됐다가 돌아오는 중인 것처럼" 가짜 흔적을
-/// 남겨두는 것이다. 그래야 switchTo가 평소처럼 pop과 ret만 해도
-/// 새 스레드의 진입점으로 뛰어든다.
-///
-/// **스택 정렬이 까다롭다.** SysV는 함수 진입 시점에 rsp % 16 == 8을
-/// 요구한다(call이 8바이트를 밀어넣은 직후 상태). ReleaseFast 빌드는
-/// SIMD를 쓰는데, 정렬이 틀리면 movaps에서 general protection fault가
-/// 난다. 원인 찾기 지독한 부류의 버그다.
+// 스택 최상단에서 초기 프레임을 만든다.
+//
+// 스택에 "이미 한 번 전환됐다가 돌아오는 중인 것처럼" 가짜 흔적을
+// 남겨두는 것이다. 그래야 switchTo가 평소처럼 pop과 ret만 해도
+// 새 스레드의 진입점으로 뛰어든다.
+//
+// **스택 정렬이 까다롭다.** SysV는 함수 진입 시점에 rsp % 16 == 8을
+// 요구한다(call이 8바이트를 밀어넣은 직후 상태). ReleaseFast 빌드는
+// SIMD를 쓰는데, 정렬이 틀리면 movaps에서 general protection fault가
+// 난다. 원인 찾기 지독한 부류의 버그다.
 pub fn initStack(stack: []u8, entry: *const fn () callconv(.c) noreturn) u64 {
     const top = @intFromPtr(stack.ptr) + stack.len;
     const aligned = top & ~@as(u64, 15); // 16바이트 정렬
 
     // 레이아웃 (주소 낮은 쪽 -> 높은 쪽):
-    //   aligned-64  r15
-    //   aligned-56  r14
-    //   aligned-48  r13
-    //   aligned-40  r12
-    //   aligned-32  rbx
-    //   aligned-24  rbp
+    //   aligned-72  r15
+    //   aligned-64  r14
+    //   aligned-56  r13
+    //   aligned-48  r12
+    //   aligned-40  rbx
+    //   aligned-32  rbp
+    //   aligned-24  rflags
     //   aligned-16  진입점 주소   <- ret가 여기로 점프
     //   aligned-8   (미사용, 정렬용 여백)
     //
     // ret 직후 rsp = aligned-8 이고, (aligned-8) % 16 == 8 이 된다.
-    const frame: [*]u64 = @ptrFromInt(aligned - 64);
+    const frame: [*]u64 = @ptrFromInt(aligned - 72);
 
     frame[0] = 0; // r15
     frame[1] = 0; // r14
@@ -101,8 +105,17 @@ pub fn initStack(stack: []u8, entry: *const fn () callconv(.c) noreturn) u64 {
     frame[3] = 0; // r12
     frame[4] = 0; // rbx
     frame[5] = 0; // rbp
-    frame[6] = @intFromPtr(entry);
-    frame[7] = 0;
 
-    return aligned - 64;
+    // 새 스레드는 인터럽트가 켜진 채로 시작한다.
+    // bit 1은 예약 비트로 항상 1이어야 하고, bit 9(IF)가 인터럽트 허용.
+    //
+    // 이게 중요한 이유: 선점은 타이머 인터럽트 핸들러 안에서
+    // 스레드를 바꾼다. 그 시점에는 인터럽트가 꺼져 있는데(interrupt gate),
+    // rflags를 스레드마다 들고 다니지 않으면 새로 실행되는 스레드도
+    // 인터럽트가 꺼진 채로 돈다. 그러면 다음 타이머가 영영 안 온다.
+    frame[6] = 0x202;
+    frame[7] = @intFromPtr(entry);
+    frame[8] = 0;
+
+    return aligned - 72;
 }

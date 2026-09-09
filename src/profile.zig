@@ -29,6 +29,8 @@ pub const Slot = enum {
     present,
     /// update~present 전체. 프레임 예산과 직접 비교하는 값.
     work,
+    /// 입력 -> 화면 반영까지. 게임에서 사람이 실제로 체감하는 지연.
+    input_latency,
 
     pub const count = @typeInfo(Slot).@"enum".fields.len;
 };
@@ -110,7 +112,7 @@ pub fn report() void {
     }
 }
 
-const std_slots = [_]Slot{ .update, .clear, .draw, .present, .work };
+const std_slots = [_]Slot{ .update, .clear, .draw, .present, .work, .input_latency };
 
 fn printPadded(value: u64, width: usize) void {
     var digits: usize = 1;
